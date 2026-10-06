@@ -21,7 +21,6 @@ import (
 	"github.com/neuralcolony/talaria/internal/runner"
 )
 
-// startServer runs an in-process nats-server with JetStream — no external binary.
 func startServer(t *testing.T) string {
 	t.Helper()
 	opts := &natssrv.Options{Host: "127.0.0.1", Port: -1, JetStream: true, StoreDir: t.TempDir()}
@@ -37,29 +36,35 @@ func startServer(t *testing.T) string {
 	return s.ClientURL()
 }
 
+func mustID(t *testing.T) *crypto.Identity {
+	t.Helper()
+	kp, err := crypto.GenerateKeypair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := crypto.NewIdentity(kp.Private)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
 type rig struct {
-	cfg    natsx.Config
-	aBox   *crypto.Box // dispatcher
-	cBox   *crypto.Box // runner
-	dispJS jetstream.JetStream
-	dispNC *nats.Conn
-	cli    *dispatch.Client
+	cfg   natsx.Config
+	scope natsx.Scope
+	aID   *crypto.Identity // dispatcher
+	cID   *crypto.Identity // runner
+	js    jetstream.JetStream
+	nc    *nats.Conn
+	cli   *dispatch.Client
 }
 
 func newRig(t *testing.T, maxBody int) *rig {
 	t.Helper()
 	url := startServer(t)
-	a, _ := crypto.GenerateKeypair()
-	c, _ := crypto.GenerateKeypair()
-	aBox, err := crypto.NewBox(a.Private, c.Public)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cBox, err := crypto.NewBox(c.Private, a.Public)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cfg := natsx.Config{URL: url, MaxBody: maxBody, RespTTL: time.Hour}
+	scope := natsx.Scope{User: "alice", Profile: "work"}
+	aID, cID := mustID(t), mustID(t)
+	cfg := natsx.Config{URL: url, Scope: scope, MaxBody: maxBody, RespTTL: time.Hour}
 
 	nc, err := natsx.Connect(cfg, "test-dispatch")
 	if err != nil {
@@ -70,15 +75,17 @@ func newRig(t *testing.T, maxBody int) *rig {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx := context.Background()
-	if err := natsx.EnsureStreams(ctx, js, cfg); err != nil {
+	if err := natsx.EnsureStreams(context.Background(), js, cfg); err != nil {
 		t.Fatal(err)
 	}
-	return &rig{cfg: cfg, aBox: aBox, cBox: cBox, dispJS: js, dispNC: nc, cli: dispatch.New(js, aBox)}
+	return &rig{
+		cfg: cfg, scope: scope, aID: aID, cID: cID, js: js, nc: nc,
+		cli: dispatch.New(js, aID, scope, cID.PublicB64()),
+	}
 }
 
-// startRunner wires a runner on its own connection and returns a stop func.
-func (r *rig) startRunner(t *testing.T) context.CancelFunc {
+// startRunner runs a runner for the rig's scope, allowing the given senders.
+func (r *rig) startRunner(t *testing.T, allow ...string) context.CancelFunc {
 	t.Helper()
 	nc, err := natsx.Connect(r.cfg, "test-runner")
 	if err != nil {
@@ -90,7 +97,7 @@ func (r *rig) startRunner(t *testing.T) context.CancelFunc {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
-		_ = runner.New(js, r.cBox, r.cfg.MaxBody, nil).Run(ctx)
+		_ = runner.New(js, r.cID, r.scope, allow, r.cfg.MaxBody, nil).Run(ctx)
 		nc.Drain()
 	}()
 	return cancel
@@ -104,50 +111,43 @@ func TestEndToEndFetch(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	rig := newRig(t, 700*1024)
-	stop := rig.startRunner(t)
-	defer stop()
+	r := newRig(t, 700*1024)
+	defer r.startRunner(t, r.aID.PublicB64())()
 
-	j := &job.Job{ID: job.NewID(), Method: "GET", URL: ts.URL,
-		Headers: map[string][]string{"User-Agent": {"talaria-test/1.0"}}}
-	resp, err := rig.cli.Do(context.Background(), j, 15*time.Second)
+	j := &job.Job{Method: "GET", URL: ts.URL, Headers: map[string][]string{"User-Agent": {"talaria-test/1.0"}}}
+	resp, err := r.cli.Do(context.Background(), j, 15*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if resp.Status != 201 {
-		t.Fatalf("status = %d, want 201 (err=%q)", resp.Status, resp.Error)
+		t.Fatalf("status = %d want 201 (err=%q)", resp.Status, resp.Error)
 	}
 	if !bytes.Equal(resp.Body, []byte("hello from GET")) {
 		t.Fatalf("body = %q", resp.Body)
 	}
 	if got := resp.Headers["X-Echo-Ua"]; len(got) == 0 || got[0] != "talaria-test/1.0" {
-		t.Fatalf("header not forwarded to origin: %v", resp.Headers)
+		t.Fatalf("header not forwarded: %v", resp.Headers)
 	}
 }
 
 func TestZeroKnowledgeAtRest(t *testing.T) {
-	rig := newRig(t, 700*1024)
+	r := newRig(t, 700*1024)
 	secretURL := "https://super-secret.example.internal/path?token=abc"
-	j := &job.Job{ID: job.NewID(), Method: "GET", URL: secretURL}
-	if err := rig.cli.Publish(context.Background(), j); err != nil {
+	if err := r.cli.Publish(context.Background(), &job.Job{Method: "GET", URL: secretURL}); err != nil {
 		t.Fatal(err)
 	}
-
-	// Read the raw message at rest from the JOBS stream.
-	ctx := context.Background()
-	stream, err := rig.dispJS.Stream(ctx, natsx.StreamJobs)
+	stream, err := r.js.Stream(context.Background(), natsx.StreamJobs)
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw, err := stream.GetMsg(ctx, 1)
+	raw, err := stream.GetMsg(context.Background(), 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(string(raw.Data), "super-secret") || strings.Contains(string(raw.Data), "token=abc") {
 		t.Fatalf("plaintext leaked at rest in B: %q", raw.Data)
 	}
-	// But the runner's box can recover it.
-	plain, err := rig.cBox.Open(raw.Data)
+	plain, err := r.cID.OpenFrom(r.aID.PublicB64(), raw.Data)
 	if err != nil {
 		t.Fatalf("runner cannot open sealed job: %v", err)
 	}
@@ -161,64 +161,91 @@ func TestZeroKnowledgeAtRest(t *testing.T) {
 }
 
 func TestDurabilityCollectAfterRunnerStarts(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		fmt.Fprint(w, "late")
-	}))
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) { fmt.Fprint(w, "late") }))
 	defer ts.Close()
 
-	rig := newRig(t, 700*1024)
-	// Publish while NO runner is up — job waits durably in JOBS.
-	j := &job.Job{ID: job.NewID(), Method: "GET", URL: ts.URL}
-	if err := rig.cli.Publish(context.Background(), j); err != nil {
+	r := newRig(t, 700*1024)
+	j := &job.Job{Method: "GET", URL: ts.URL}
+	if err := r.cli.Publish(context.Background(), j); err != nil {
 		t.Fatal(err)
 	}
-	// Now bring the runner up and collect.
-	stop := rig.startRunner(t)
-	defer stop()
-	resp, err := rig.cli.Collect(context.Background(), j.ID, 15*time.Second)
+	defer r.startRunner(t, r.aID.PublicB64())()
+	resp, err := r.cli.Collect(context.Background(), j.ID, 15*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if resp.Status != 200 || !bytes.Equal(resp.Body, []byte("late")) {
-		t.Fatalf("unexpected response: %d %q %q", resp.Status, resp.Body, resp.Error)
+		t.Fatalf("unexpected: %d %q %q", resp.Status, resp.Body, resp.Error)
 	}
 }
 
 func TestOversizeBodyReturnsError(t *testing.T) {
 	big := strings.Repeat("A", 4096)
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		fmt.Fprint(w, big)
-	}))
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) { fmt.Fprint(w, big) }))
 	defer ts.Close()
 
-	rig := newRig(t, 1024) // cap below the response size
-	stop := rig.startRunner(t)
-	defer stop()
-
-	resp, err := rig.cli.Do(context.Background(), &job.Job{ID: job.NewID(), Method: "GET", URL: ts.URL}, 15*time.Second)
+	r := newRig(t, 1024)
+	defer r.startRunner(t, r.aID.PublicB64())()
+	resp, err := r.cli.Do(context.Background(), &job.Job{Method: "GET", URL: ts.URL}, 15*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.Error == "" {
-		t.Fatal("expected oversize error")
-	}
-	if len(resp.Body) != 0 {
-		t.Fatalf("oversize body should be dropped, got %d bytes", len(resp.Body))
+	if resp.Error == "" || len(resp.Body) != 0 {
+		t.Fatalf("expected oversize error with dropped body, got err=%q len=%d", resp.Error, len(resp.Body))
 	}
 }
 
 func TestBadURLReturnsErrorNotHang(t *testing.T) {
-	rig := newRig(t, 700*1024)
-	stop := rig.startRunner(t)
-	defer stop()
-
-	// Unroutable port → connection refused quickly; runner must report, not hang.
-	j := &job.Job{ID: job.NewID(), Method: "GET", URL: "http://127.0.0.1:1/nope", TimeoutMS: 2000}
-	resp, err := rig.cli.Do(context.Background(), j, 15*time.Second)
+	r := newRig(t, 700*1024)
+	defer r.startRunner(t, r.aID.PublicB64())()
+	j := &job.Job{Method: "GET", URL: "http://127.0.0.1:1/nope", TimeoutMS: 2000}
+	resp, err := r.cli.Do(context.Background(), j, 15*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if resp.Error == "" {
 		t.Fatalf("expected request error, got status %d", resp.Status)
+	}
+}
+
+// TestRejectsUnauthorizedSender: a rogue dispatcher (not in the runner's
+// allowlist) publishes into the scope; the runner must drop it and no response
+// appears.
+func TestRejectsUnauthorizedSender(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) { fmt.Fprint(w, "ok") }))
+	defer ts.Close()
+
+	r := newRig(t, 700*1024)
+	// Runner allows only the legit dispatcher aID.
+	defer r.startRunner(t, r.aID.PublicB64())()
+
+	rogue := mustID(t)
+	rogueCli := dispatch.New(r.js, rogue, r.scope, r.cID.PublicB64())
+	j := &job.Job{Method: "GET", URL: ts.URL}
+	if err := rogueCli.Publish(context.Background(), j); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rogueCli.Collect(context.Background(), j.ID, 2*time.Second); err == nil {
+		t.Fatal("rogue sender should get no response")
+	}
+}
+
+// TestCrossScopeNoDelivery: a dispatcher in a different scope gets no response
+// when the only runner serves another scope.
+func TestCrossScopeNoDelivery(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) { fmt.Fprint(w, "ok") }))
+	defer ts.Close()
+
+	r := newRig(t, 700*1024)                    // scope alice/work
+	defer r.startRunner(t, r.aID.PublicB64())() // runner only for alice/work
+
+	otherScope := natsx.Scope{User: "bob", Profile: "home"}
+	otherCli := dispatch.New(r.js, r.aID, otherScope, r.cID.PublicB64())
+	j := &job.Job{Method: "GET", URL: ts.URL}
+	if err := otherCli.Publish(context.Background(), j); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := otherCli.Collect(context.Background(), j.ID, 2*time.Second); err == nil {
+		t.Fatal("cross-scope request should not be served")
 	}
 }

@@ -1,19 +1,23 @@
-// Package crypto provides authenticated end-to-end encryption between the
-// dispatcher (A) and runner (C) using NaCl box (X25519 + XSalsa20-Poly1305).
+// Package crypto provides authenticated end-to-end encryption between a
+// dispatcher (A) and a runner (C) using NaCl box (X25519 + XSalsa20-Poly1305).
 //
 // The queue (B) persists messages and can read them, so transport TLS is not
-// enough: every envelope is sealed here before publishing and opened only by the
-// peer. box is authenticated, so the opener also verifies the message came from
-// the expected peer. B only ever holds {nonce||ciphertext} and cannot read or
-// forge it.
+// enough: every envelope is sealed here and opened only by the peer. box is
+// authenticated — opening also proves the message came from the holder of the
+// expected key. B only ever holds {nonce||ciphertext}.
+//
+// Multi-tenant: an Identity holds this machine's private key and can seal to /
+// open from ANY peer public key. A dispatcher seals to the runner's key; a
+// runner (which may serve several authorized dispatchers) opens from and seals
+// back to whichever sender's key the job named — see internal/runner.
 package crypto
 
 import (
 	"crypto/rand"
 	"encoding/base64"
 	"fmt"
-	"io"
 
+	"golang.org/x/crypto/curve25519"
 	"golang.org/x/crypto/nacl/box"
 )
 
@@ -53,49 +57,64 @@ func parseKey(b64 string) (*[keySize]byte, error) {
 	return &k, nil
 }
 
-// Box seals to / opens from a single peer. Because NaCl box derives a symmetric
-// shared secret from (selfPriv, peerPub), one Box both seals outbound and opens
-// inbound for that peer. The dispatcher holds Box{A_priv, C_pub}; the runner
-// holds Box{C_priv, A_pub}; they interoperate in both directions.
-type Box struct {
-	peerPub  *[keySize]byte
-	selfPriv *[keySize]byte
+// Identity is this machine's keypair. It seals to / opens from a peer identified
+// by their base64 public key.
+type Identity struct {
+	priv [keySize]byte
+	pub  [keySize]byte
 }
 
-// NewBox builds a Box from this machine's base64 private key and the peer's
-// base64 public key.
-func NewBox(selfPrivB64, peerPubB64 string) (*Box, error) {
+// NewIdentity builds an Identity from this machine's base64 private key,
+// deriving the matching public key.
+func NewIdentity(selfPrivB64 string) (*Identity, error) {
 	priv, err := parseKey(selfPrivB64)
 	if err != nil {
 		return nil, fmt.Errorf("self private key: %w", err)
 	}
-	pub, err := parseKey(peerPubB64)
+	pubBytes, err := curve25519.X25519(priv[:], curve25519.Basepoint)
+	if err != nil {
+		return nil, fmt.Errorf("crypto: derive public key: %w", err)
+	}
+	id := &Identity{priv: *priv}
+	copy(id.pub[:], pubBytes)
+	return id, nil
+}
+
+// PublicB64 is this identity's public key, base64-encoded. It is what a
+// dispatcher advertises as its "sender" and what a runner lists in its
+// allowlist.
+func (id *Identity) PublicB64() string {
+	return base64.StdEncoding.EncodeToString(id.pub[:])
+}
+
+// SealTo encrypts and authenticates plaintext for the peer, returning
+// nonce||ciphertext.
+func (id *Identity) SealTo(peerPubB64 string, plaintext []byte) ([]byte, error) {
+	peer, err := parseKey(peerPubB64)
 	if err != nil {
 		return nil, fmt.Errorf("peer public key: %w", err)
 	}
-	return &Box{peerPub: pub, selfPriv: priv}, nil
-}
-
-// Seal encrypts and authenticates plaintext for the peer, returning
-// nonce||ciphertext.
-func (b *Box) Seal(plaintext []byte) ([]byte, error) {
 	var nonce [nonceSize]byte
-	if _, err := io.ReadFull(rand.Reader, nonce[:]); err != nil {
+	if _, err := rand.Read(nonce[:]); err != nil {
 		return nil, err
 	}
-	// Prepend the nonce so Open can recover it; box.Seal appends ciphertext.
-	return box.Seal(nonce[:], plaintext, &nonce, b.peerPub, b.selfPriv), nil
+	return box.Seal(nonce[:], plaintext, &nonce, peer, &id.priv), nil
 }
 
-// Open verifies and decrypts a nonce||ciphertext produced by the peer's Seal.
-// A tampered message or wrong key fails with an error (no partial plaintext).
-func (b *Box) Open(sealed []byte) ([]byte, error) {
+// OpenFrom verifies and decrypts a nonce||ciphertext produced by the peer's
+// SealTo. A tampered message, or one not sealed by the holder of peerPub's
+// private key, fails with an error (no partial plaintext).
+func (id *Identity) OpenFrom(peerPubB64 string, sealed []byte) ([]byte, error) {
+	peer, err := parseKey(peerPubB64)
+	if err != nil {
+		return nil, fmt.Errorf("peer public key: %w", err)
+	}
 	if len(sealed) < nonceSize {
 		return nil, fmt.Errorf("crypto: sealed message too short")
 	}
 	var nonce [nonceSize]byte
 	copy(nonce[:], sealed[:nonceSize])
-	out, ok := box.Open(nil, sealed[nonceSize:], &nonce, b.peerPub, b.selfPriv)
+	out, ok := box.Open(nil, sealed[nonceSize:], &nonce, peer, &id.priv)
 	if !ok {
 		return nil, fmt.Errorf("crypto: open failed (tampered, truncated, or wrong key)")
 	}

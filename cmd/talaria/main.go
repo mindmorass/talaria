@@ -1,22 +1,24 @@
-// Command talaria is the single binary for all three roles' client side:
+// Command talaria is the single binary for the dispatcher and runner client
+// sides, plus key/tenant provisioning:
 //
-//	talaria keygen            generate an X25519 keypair for A or C
-//	talaria run               C-side runner: execute jobs from the lab
-//	talaria send --url ...     A-side dispatcher: send one fetch job, print result
+//	talaria keygen                      generate one X25519 keypair
+//	talaria onboard --user U --profile P  mint a scope's keypairs + config blocks
+//	talaria run                         C-side runner: execute jobs for a scope
+//	talaria send --url ...               A-side dispatcher: send one job, print result
 //
 // B is stock nats-server (see deploy/), not this binary.
 package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
-
-	"flag"
 
 	"github.com/neuralcolony/talaria/internal/crypto"
 	"github.com/neuralcolony/talaria/internal/dispatch"
@@ -30,11 +32,13 @@ func main() {
 		usage()
 		os.Exit(2)
 	}
-	loadDotenv() // populate env from ./.env (or $TALARIA_ENV) without overriding real env
+	loadDotenv()
 	var err error
 	switch os.Args[1] {
 	case "keygen":
 		err = cmdKeygen(os.Args[2:])
+	case "onboard":
+		err = cmdOnboard(os.Args[2:])
 	case "run":
 		err = cmdRun(os.Args[2:])
 	case "send":
@@ -54,20 +58,24 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprint(os.Stderr, `talaria — encrypted async remote-fetch dispatcher
+	fmt.Fprint(os.Stderr, `talaria — encrypted async remote-fetch dispatcher (multi-tenant)
 
 usage:
-  talaria keygen            generate an X25519 keypair (run on A and on C)
-  talaria run               start the runner (on C): execute jobs, egress locally
-  talaria send --url URL    dispatch one fetch job (on A) and print the response
+  talaria keygen                        generate one X25519 keypair
+  talaria onboard --user U --profile P  mint a scope's dispatcher+runner keys and
+                                        config blocks (optionally -out DIR)
+  talaria run                           start the runner for a scope (on C)
+  talaria send --url URL                dispatch one fetch job for a scope (on A)
 
 config via environment (or a .env file in the working dir):
-  TALARIA_NATS_URL   wss://... (required)
+  TALARIA_NATS_URL    wss://... (required)
   TALARIA_NATS_TOKEN | TALARIA_NATS_USER/PASS | TALARIA_NATS_CREDS
-  TALARIA_SELF_PRIV  this machine's base64 private key (required for run/send)
-  TALARIA_PEER_PUB   the peer's base64 public key     (required for run/send)
-  TALARIA_MAX_BODY   runner inline response cap in bytes (default 716800)
-  TALARIA_RESP_TTL   response retention, e.g. 1h (default 1h)
+  TALARIA_USER, TALARIA_PROFILE   the scope (required for run/send)
+  TALARIA_SELF_PRIV   this machine's base64 private key
+  TALARIA_PEER_PUB    dispatcher: the runner's base64 public key
+  TALARIA_ALLOWED_SENDERS  runner: comma-separated authorized dispatcher pubkeys
+  TALARIA_MAX_BODY    runner inline response cap in bytes (default 716800)
+  TALARIA_RESP_TTL    response retention, e.g. 1h (default 1h)
 `)
 }
 
@@ -80,19 +88,90 @@ func cmdKeygen(args []string) error {
 	}
 	fmt.Printf("# Keep PRIVATE on this machine; share PUBLIC with the peer.\n")
 	fmt.Printf("TALARIA_SELF_PRIV=%s\n", kp.Private)
-	fmt.Printf("# peer configures:  TALARIA_PEER_PUB=%s\n", kp.Public)
+	fmt.Printf("# peer configures this as a sender/peer:  %s\n", kp.Public)
+	return nil
+}
+
+func cmdOnboard(args []string) error {
+	fs := flag.NewFlagSet("onboard", flag.ExitOnError)
+	user := fs.String("user", "", "user segment of the scope (required)")
+	profile := fs.String("profile", "", "profile segment of the scope (required)")
+	out := fs.String("out", "", "directory to write dispatcher.env and runner.env (0600); if empty, print")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	scope := natsx.Scope{User: *user, Profile: *profile}
+	if err := scope.Validate(); err != nil {
+		return err
+	}
+	disp, err := crypto.GenerateKeypair()
+	if err != nil {
+		return err
+	}
+	run, err := crypto.GenerateKeypair()
+	if err != nil {
+		return err
+	}
+
+	dispEnv := fmt.Sprintf(`# talaria DISPATCHER (machine A) — scope %s
+TALARIA_USER=%s
+TALARIA_PROFILE=%s
+TALARIA_SELF_PRIV=%s
+TALARIA_PEER_PUB=%s
+# fill in transport + NATS auth for this scope:
+TALARIA_NATS_URL=wss://b.example.com/talaria
+TALARIA_NATS_USER=
+TALARIA_NATS_PASS=
+`, scope.String(), scope.User, scope.Profile, disp.Private, run.Public)
+
+	runEnv := fmt.Sprintf(`# talaria RUNNER (machine C) — scope %s
+TALARIA_USER=%s
+TALARIA_PROFILE=%s
+TALARIA_SELF_PRIV=%s
+TALARIA_ALLOWED_SENDERS=%s
+# fill in transport + NATS auth for this scope:
+TALARIA_NATS_URL=wss://b.example.com/talaria
+TALARIA_NATS_USER=
+TALARIA_NATS_PASS=
+`, scope.String(), scope.User, scope.Profile, run.Private, disp.Public)
+
+	if *out == "" {
+		fmt.Printf("# ===== dispatcher.env (machine A) =====\n%s\n", dispEnv)
+		fmt.Printf("# ===== runner.env (machine C) =====\n%s\n", runEnv)
+		fmt.Fprintln(os.Stderr, "note: these contain PRIVATE keys; prefer -out DIR to write 0600 files")
+		return nil
+	}
+	if err := os.MkdirAll(*out, 0o700); err != nil {
+		return err
+	}
+	dp := filepath.Join(*out, "dispatcher.env")
+	rp := filepath.Join(*out, "runner.env")
+	if err := os.WriteFile(dp, []byte(dispEnv), 0o600); err != nil {
+		return err
+	}
+	if err := os.WriteFile(rp, []byte(runEnv), 0o600); err != nil {
+		return err
+	}
+	fmt.Printf("wrote %s and %s (0600)\n", dp, rp)
+	fmt.Println("deliver dispatcher.env to A and runner.env to C; set NATS auth in each.")
 	return nil
 }
 
 func cmdRun(args []string) error {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
+	user := fs.String("user", "", "override TALARIA_USER")
+	profile := fs.String("profile", "", "override TALARIA_PROFILE")
 	_ = fs.Parse(args)
+	applyScopeFlags(*user, *profile)
 
 	cfg, err := natsx.LoadConfig()
 	if err != nil {
 		return err
 	}
-	box, err := crypto.NewBox(cfg.SelfPriv, cfg.PeerPub)
+	if cfg.SelfPriv == "" {
+		return fmt.Errorf("TALARIA_SELF_PRIV is required for the runner")
+	}
+	id, err := crypto.NewIdentity(cfg.SelfPriv)
 	if err != nil {
 		return fmt.Errorf("keys: %w", err)
 	}
@@ -105,18 +184,18 @@ func cmdRun(args []string) error {
 	if err != nil {
 		return err
 	}
-
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-
 	if err := natsx.EnsureStreams(ctx, js, cfg); err != nil {
 		return err
 	}
-	return runner.New(js, box, cfg.MaxBody, nil).Run(ctx)
+	return runner.New(js, id, cfg.Scope, cfg.AllowedSenders, cfg.MaxBody, nil).Run(ctx)
 }
 
 func cmdSend(args []string) error {
 	fs := flag.NewFlagSet("send", flag.ExitOnError)
+	user := fs.String("user", "", "override TALARIA_USER")
+	profile := fs.String("profile", "", "override TALARIA_PROFILE")
 	method := fs.String("method", "GET", "HTTP method")
 	url := fs.String("url", "", "target URL (required)")
 	data := fs.String("data", "", "request body")
@@ -131,12 +210,16 @@ func cmdSend(args []string) error {
 	if *url == "" {
 		return fmt.Errorf("--url is required")
 	}
+	applyScopeFlags(*user, *profile)
 
 	cfg, err := natsx.LoadConfig()
 	if err != nil {
 		return err
 	}
-	box, err := crypto.NewBox(cfg.SelfPriv, cfg.PeerPub)
+	if cfg.SelfPriv == "" || cfg.PeerPub == "" {
+		return fmt.Errorf("TALARIA_SELF_PRIV and TALARIA_PEER_PUB are required for the dispatcher")
+	}
+	id, err := crypto.NewIdentity(cfg.SelfPriv)
 	if err != nil {
 		return fmt.Errorf("keys: %w", err)
 	}
@@ -164,9 +247,7 @@ func cmdSend(args []string) error {
 	if *data != "" {
 		j.Body = []byte(*data)
 	}
-
-	cli := dispatch.New(js, box)
-	resp, err := cli.Do(ctx, j, *wait)
+	resp, err := dispatch.New(js, id, cfg.Scope, cfg.PeerPub).Do(ctx, j, *wait)
 	if err != nil {
 		return err
 	}
@@ -196,7 +277,16 @@ func cmdSend(args []string) error {
 	return nil
 }
 
-// headerFlags collects repeated --header values.
+// applyScopeFlags lets --user/--profile override the env before LoadConfig.
+func applyScopeFlags(user, profile string) {
+	if user != "" {
+		_ = os.Setenv("TALARIA_USER", user)
+	}
+	if profile != "" {
+		_ = os.Setenv("TALARIA_PROFILE", profile)
+	}
+}
+
 type headerFlags []string
 
 func (h *headerFlags) String() string { return strings.Join(*h, ", ") }
@@ -214,14 +304,12 @@ func (h headerFlags) toMap() map[string][]string {
 		if !ok {
 			continue
 		}
-		k = strings.TrimSpace(k)
-		v = strings.TrimSpace(v)
-		m[k] = append(m[k], v)
+		m[strings.TrimSpace(k)] = append(m[strings.TrimSpace(k)], strings.TrimSpace(v))
 	}
 	return m
 }
 
-// loadDotenv loads KEY=VALUE lines from $TALARIA_ENV or ./.env, without
+// loadDotenv loads KEY=VALUE lines from $TALARIA_ENV or ./.env without
 // overriding variables already present in the real environment.
 func loadDotenv() {
 	path := os.Getenv("TALARIA_ENV")

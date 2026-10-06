@@ -1,7 +1,8 @@
-// Package runner is the C-side worker: it consumes sealed jobs from the queue,
-// opens them, performs the HTTP request from inside the lab (this is where
-// egress — and Netskope inspection — happens), then seals and publishes the
-// response. It always publishes something, so the dispatcher never blocks.
+// Package runner is the C-side worker: it consumes sealed jobs for its scope,
+// authenticates the sender against an allowlist, opens the job, performs the
+// HTTP request from inside the lab (egress — and Netskope inspection — happen
+// here), then seals the response back to that sender and publishes it. It always
+// publishes something, so the dispatcher never blocks.
 package runner
 
 import (
@@ -21,59 +22,75 @@ import (
 
 const defaultTimeout = 30 * time.Second
 
-// Runner executes jobs. The zero HTTP client deliberately uses the system trust
-// store (no cert pinning) so Netskope's inline CA is honored on the managed box.
+// Runner executes jobs for one scope. The zero HTTP client deliberately uses the
+// system trust store (no cert pinning) so Netskope's inline CA is honored.
 type Runner struct {
 	js      jetstream.JetStream
-	box     *crypto.Box
+	id      *crypto.Identity
+	scope   natsx.Scope
+	allow   map[string]bool // authorized dispatcher public keys (base64)
 	client  *http.Client
 	maxBody int
 	log     *slog.Logger
 }
 
-func New(js jetstream.JetStream, box *crypto.Box, maxBody int, log *slog.Logger) *Runner {
+// New builds a Runner. allow is the set of authorized dispatcher public keys;
+// jobs whose sender is not in it are rejected without decryption.
+func New(js jetstream.JetStream, id *crypto.Identity, scope natsx.Scope, allow []string, maxBody int, log *slog.Logger) *Runner {
 	if log == nil {
 		log = slog.Default()
 	}
+	set := make(map[string]bool, len(allow))
+	for _, k := range allow {
+		set[k] = true
+	}
 	return &Runner{
 		js:      js,
-		box:     box,
-		client:  &http.Client{}, // per-request timeout applied via context
+		id:      id,
+		scope:   scope,
+		allow:   set,
+		client:  &http.Client{},
 		maxBody: maxBody,
 		log:     log,
 	}
 }
 
-// Run binds the shared durable pull consumer and processes jobs until ctx is
-// cancelled. Multiple Runner processes on the same durable load-balance.
+// Run binds this scope's durable pull consumer and processes jobs until ctx is
+// cancelled. Multiple Runner processes in the same scope load-balance.
 func (r *Runner) Run(ctx context.Context) error {
+	if len(r.allow) == 0 {
+		return fmt.Errorf("runner: empty sender allowlist (set TALARIA_ALLOWED_SENDERS or TALARIA_PEER_PUB)")
+	}
 	cons, err := r.js.CreateOrUpdateConsumer(ctx, natsx.StreamJobs, jetstream.ConsumerConfig{
-		Durable:       natsx.RunnerDurable,
+		Durable:       r.scope.Durable(),
 		AckPolicy:     jetstream.AckExplicitPolicy,
-		FilterSubject: natsx.SubjectJobs,
+		FilterSubject: r.scope.JobsSubject(),
 		AckWait:       time.Minute,
 	})
 	if err != nil {
 		return fmt.Errorf("create runner consumer: %w", err)
 	}
-	cc, err := cons.Consume(func(msg jetstream.Msg) {
-		r.handle(ctx, msg)
-	})
+	cc, err := cons.Consume(func(msg jetstream.Msg) { r.handle(ctx, msg) })
 	if err != nil {
 		return fmt.Errorf("consume: %w", err)
 	}
 	defer cc.Stop()
-	r.log.Info("runner started", "stream", natsx.StreamJobs, "durable", natsx.RunnerDurable)
+	r.log.Info("runner started", "scope", r.scope.String(), "senders", len(r.allow))
 	<-ctx.Done()
 	return nil
 }
 
 func (r *Runner) handle(ctx context.Context, msg jetstream.Msg) {
-	sealed := msg.Data()
-	plain, err := r.box.Open(sealed)
+	sender := msg.Headers().Get(natsx.HeaderSender)
+	if sender == "" || !r.allow[sender] {
+		r.log.Warn("drop job from unauthorized sender", "scope", r.scope.String(), "sender", sender)
+		_ = msg.Term()
+		return
+	}
+	plain, err := r.id.OpenFrom(sender, msg.Data())
 	if err != nil {
-		// Can't decrypt/authenticate — this is not ours to retry. Drop it.
-		r.log.Error("drop undecryptable job", "err", err)
+		// Named an allowed sender but not sealed by that sender's key.
+		r.log.Error("drop job: open failed", "sender", sender, "err", err)
 		_ = msg.Term()
 		return
 	}
@@ -83,9 +100,14 @@ func (r *Runner) handle(ctx context.Context, msg jetstream.Msg) {
 		_ = msg.Term()
 		return
 	}
+	// Defense in depth: the authenticated envelope must agree with the routing.
+	if j.Sender != sender || j.User != r.scope.User || j.Profile != r.scope.Profile {
+		r.log.Error("drop job: scope/sender mismatch", "job_scope", j.User+"/"+j.Profile, "runner_scope", r.scope.String())
+		_ = msg.Term()
+		return
+	}
 	resp := r.fetch(ctx, j)
-	if err := r.publish(ctx, resp); err != nil {
-		// Could not publish the response; NAK so it redelivers and we retry.
+	if err := r.publish(ctx, sender, resp); err != nil {
 		r.log.Error("publish response failed; will redeliver", "id", j.ID, "err", err)
 		_ = msg.Nak()
 		return
@@ -93,8 +115,7 @@ func (r *Runner) handle(ctx context.Context, msg jetstream.Msg) {
 	_ = msg.Ack()
 }
 
-// fetch performs the HTTP request and ALWAYS returns a Response (error field set
-// on failure).
+// fetch performs the HTTP request and ALWAYS returns a Response.
 func (r *Runner) fetch(ctx context.Context, j *job.Job) *job.Response {
 	start := time.Now()
 	out := &job.Response{ID: j.ID}
@@ -103,12 +124,10 @@ func (r *Runner) fetch(ctx context.Context, j *job.Job) *job.Response {
 		out.FinishedAt = time.Now().UTC()
 		return out
 	}
-
 	if err := j.Validate(); err != nil {
 		out.Error = err.Error()
 		return finish()
 	}
-
 	timeout := defaultTimeout
 	if j.TimeoutMS > 0 {
 		timeout = time.Duration(j.TimeoutMS) * time.Millisecond
@@ -130,19 +149,15 @@ func (r *Runner) fetch(ctx context.Context, j *job.Job) *job.Response {
 			req.Header.Add(k, v)
 		}
 	}
-
 	resp, err := r.client.Do(req)
 	if err != nil {
-		// Includes Netskope-enforced blocks surfacing as connection/TLS errors.
 		out.Error = fmt.Sprintf("request failed: %v", err)
 		return finish()
 	}
 	defer resp.Body.Close()
-
 	out.Status = resp.StatusCode
 	out.Headers = map[string][]string(resp.Header)
 
-	// Enforce the inline body cap: read one extra byte to detect overflow.
 	limited := io.LimitReader(resp.Body, int64(r.maxBody)+1)
 	data, err := io.ReadAll(limited)
 	if err != nil {
@@ -159,15 +174,15 @@ func (r *Runner) fetch(ctx context.Context, j *job.Job) *job.Response {
 	return finish()
 }
 
-func (r *Runner) publish(ctx context.Context, resp *job.Response) error {
+func (r *Runner) publish(ctx context.Context, sender string, resp *job.Response) error {
 	raw, err := resp.Marshal()
 	if err != nil {
 		return err
 	}
-	sealed, err := r.box.Seal(raw)
+	sealed, err := r.id.SealTo(sender, raw) // seal back to the requester
 	if err != nil {
 		return err
 	}
-	_, err = r.js.Publish(ctx, natsx.SubjectRespPrefix+resp.ID, sealed)
+	_, err = r.js.Publish(ctx, r.scope.RespSubject(resp.ID), sealed)
 	return err
 }
