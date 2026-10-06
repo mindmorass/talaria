@@ -1,0 +1,5 @@
+/talaria
+*.exe
+.env
+*.creds
+/dist/

@@ -1,0 +1,21 @@
+# Machine B: stock nats-server with JetStream + WebSocket, behind the existing
+# TLS reverse proxy. Only the WebSocket port is exposed to the proxy network;
+# the native 4222 client port is intentionally never published.
+services:
+  nats:
+    image: nats:2.10-alpine
+    command: ["-c", "/etc/nats/nats.conf"]
+    volumes:
+      - ./nats.conf:/etc/nats/nats.conf:ro
+      - talaria-js:/data/jetstream
+    environment:
+      - TALARIA_DISPATCHER_PASS=${TALARIA_DISPATCHER_PASS:?set TALARIA_DISPATCHER_PASS}
+      - TALARIA_RUNNER_PASS=${TALARIA_RUNNER_PASS:?set TALARIA_RUNNER_PASS}
+    expose:
+      - "8443"
+    # If the reverse proxy runs on the host, publish to loopback only:
+    #   ports: ["127.0.0.1:8443:8443"]
+    restart: unless-stopped
+
+volumes:
+  talaria-js:
