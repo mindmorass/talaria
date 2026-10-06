@@ -14,10 +14,10 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/mindmorass/talaria/internal/crypto"
+	"github.com/mindmorass/talaria/internal/job"
+	"github.com/mindmorass/talaria/internal/natsx"
 	"github.com/nats-io/nats.go/jetstream"
-	"github.com/neuralcolony/talaria/internal/crypto"
-	"github.com/neuralcolony/talaria/internal/job"
-	"github.com/neuralcolony/talaria/internal/natsx"
 )
 
 const defaultTimeout = 30 * time.Second

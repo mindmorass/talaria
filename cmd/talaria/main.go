@@ -20,12 +20,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/neuralcolony/talaria/internal/crypto"
-	"github.com/neuralcolony/talaria/internal/dispatch"
-	"github.com/neuralcolony/talaria/internal/job"
-	"github.com/neuralcolony/talaria/internal/natsauth"
-	"github.com/neuralcolony/talaria/internal/natsx"
-	"github.com/neuralcolony/talaria/internal/runner"
+	"github.com/mindmorass/talaria/internal/crypto"
+	"github.com/mindmorass/talaria/internal/dispatch"
+	"github.com/mindmorass/talaria/internal/job"
+	"github.com/mindmorass/talaria/internal/natsauth"
+	"github.com/mindmorass/talaria/internal/natsx"
+	"github.com/mindmorass/talaria/internal/runner"
 )
 
 func main() {

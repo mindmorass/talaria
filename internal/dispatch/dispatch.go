@@ -9,11 +9,11 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/mindmorass/talaria/internal/crypto"
+	"github.com/mindmorass/talaria/internal/job"
+	"github.com/mindmorass/talaria/internal/natsx"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
-	"github.com/neuralcolony/talaria/internal/crypto"
-	"github.com/neuralcolony/talaria/internal/job"
-	"github.com/neuralcolony/talaria/internal/natsx"
 )
 
 const defaultCollectWait = 35 * time.Second

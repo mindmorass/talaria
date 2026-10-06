@@ -1,4 +1,4 @@
-module github.com/neuralcolony/talaria
+module github.com/mindmorass/talaria
 
 go 1.26.5
 

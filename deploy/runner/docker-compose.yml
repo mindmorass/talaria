@@ -4,7 +4,7 @@
 # C has no admin but already has Docker, so the runner runs as a container here.
 services:
   runner:
-    image: ${TALARIA_IMAGE:-ghcr.io/neuralcolony/talaria:latest}
+    image: ${TALARIA_IMAGE:-ghcr.io/mindmorass/talaria:latest}
     # Or build locally instead of pulling:
     build:
       context: ../..
