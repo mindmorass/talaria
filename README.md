@@ -15,8 +15,8 @@ simple runner, fan-out to many runners, and endpoint-side observability.
 - Transport is **wss://** only (TLS), through B's reverse proxy.
 - Every job/response is **end-to-end sealed** with NaCl `box` (X25519). B stores
   only `{id, nonce, ciphertext}`.
-- **Multi-tenant** by **scope = (user, profile)**: subjects are
-  `fetch.<user>.<profile>.jobs` / `.responses.<id>`. A runner serves one scope
+- **Multi-tenant** by **profile** (one NATS account per profile): subjects are
+  `fetch.<profile>.jobs` / `.responses.<id>`. A runner serves one profile
   and authenticates each job's sender against an allowlist; the response is
   sealed back to that sender.
 - **Auth** is NATS **decentralized JWT** (operator → account → user), one account
@@ -34,8 +34,8 @@ docker build -t talaria .
 ## Provision a tenant
 
 ```sh
-# Mint a scope's keys, NATS account/user creds, and config blocks:
-talaria onboard --mint-nats --out ./tenants --user alice --profile work
+# Mint a tenant's keys, NATS account/user creds, and config blocks:
+talaria onboard --mint-nats --out ./tenants --profile lakeview
 ```
 
 This writes (0600 where secret):
@@ -46,7 +46,7 @@ tenants/
   system_account                   # system account pubkey
   accounts/<pub>.jwt               # one per tenant account (+ system)
   preload.conf                     # operator + system_account + resolver_preload
-  alice-work/
+  lakeview/
     dispatcher.env  dispatcher.creds   # -> machine A
     runner.env      runner.creds       # -> machine C
 ```

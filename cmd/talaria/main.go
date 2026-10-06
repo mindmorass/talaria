@@ -2,7 +2,7 @@
 // sides, plus key/tenant provisioning:
 //
 //	talaria keygen                      generate one X25519 keypair
-//	talaria onboard --user U --profile P  mint a scope's keypairs + config blocks
+//	talaria onboard --profile P           mint a tenant's keypairs + config blocks
 //	talaria run                         C-side runner: execute jobs for a scope
 //	talaria send --url ...               A-side dispatcher: send one job, print result
 //
@@ -71,9 +71,9 @@ func usage() {
 
 usage:
   talaria keygen                        generate one X25519 keypair
-  talaria onboard --user U --profile P  mint a scope's dispatcher+runner keys and
+  talaria onboard --profile P           mint a tenant's dispatcher+runner keys and
                                         config blocks (optionally -out DIR)
-  talaria onboard --user U --profile P --manifest out.json [--operator-seed S]
+  talaria onboard --profile P --manifest out.json [--operator-seed S]
                                         mint a tenant as a JSON manifest (for IaC)
   talaria run                           start the runner for a scope (on C)
   talaria send --url URL                dispatch one fetch job for a scope (on A)
@@ -82,7 +82,7 @@ usage:
 config via environment (or a .env file in the working dir):
   TALARIA_NATS_URL    wss://... (required)
   TALARIA_NATS_TOKEN | TALARIA_NATS_USER/PASS | TALARIA_NATS_CREDS
-  TALARIA_USER, TALARIA_PROFILE   the scope (required for run/send)
+  TALARIA_PROFILE     the tenant/profile (required for run/send)
   TALARIA_SELF_PRIV   this machine's base64 private key
   TALARIA_PEER_PUB    dispatcher: the runner's base64 public key
   TALARIA_ALLOWED_SENDERS  runner: comma-separated authorized dispatcher pubkeys
@@ -106,8 +106,7 @@ func cmdKeygen(args []string) error {
 
 func cmdOnboard(args []string) error {
 	fs := flag.NewFlagSet("onboard", flag.ExitOnError)
-	user := fs.String("user", "", "user segment of the scope (required)")
-	profile := fs.String("profile", "", "profile segment of the scope (required)")
+	profile := fs.String("profile", "", "tenant/profile name (required)")
 	out := fs.String("out", "", "directory to write env/creds (0600); if empty, print env blocks")
 	mintNats := fs.Bool("mint-nats", false, "also mint NATS operator/account/user JWT creds (requires -out)")
 	manifest := fs.String("manifest", "", "write a machine-readable JSON manifest of this tenant to PATH (0600) and exit")
@@ -115,7 +114,7 @@ func cmdOnboard(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	scope := natsx.Scope{User: *user, Profile: *profile}
+	scope := natsx.Scope{Profile: *profile}
 	if err := scope.Validate(); err != nil {
 		return err
 	}
@@ -145,23 +144,21 @@ func cmdOnboard(args []string) error {
 		runAuth = "TALARIA_NATS_CREDS=runner.creds"
 	}
 
-	dispEnv := fmt.Sprintf(`# talaria DISPATCHER (machine A) — scope %s
-TALARIA_USER=%s
+	dispEnv := fmt.Sprintf(`# talaria DISPATCHER (machine A) — profile %s
 TALARIA_PROFILE=%s
 TALARIA_SELF_PRIV=%s
 TALARIA_PEER_PUB=%s
 TALARIA_NATS_URL=wss://b.example.com/talaria
 %s
-`, scope.String(), scope.User, scope.Profile, disp.Private, run.Public, dispAuth)
+`, scope.String(), scope.Profile, disp.Private, run.Public, dispAuth)
 
-	runEnv := fmt.Sprintf(`# talaria RUNNER (machine C) — scope %s
-TALARIA_USER=%s
+	runEnv := fmt.Sprintf(`# talaria RUNNER (machine C) — profile %s
 TALARIA_PROFILE=%s
 TALARIA_SELF_PRIV=%s
 TALARIA_ALLOWED_SENDERS=%s
 TALARIA_NATS_URL=wss://b.example.com/talaria
 %s
-`, scope.String(), scope.User, scope.Profile, run.Private, disp.Public, runAuth)
+`, scope.String(), scope.Profile, run.Private, disp.Public, runAuth)
 
 	if *out == "" {
 		fmt.Printf("# ===== dispatcher.env (machine A) =====\n%s\n", dispEnv)
@@ -169,7 +166,7 @@ TALARIA_NATS_URL=wss://b.example.com/talaria
 		fmt.Fprintln(os.Stderr, "note: these contain PRIVATE keys; prefer -out DIR to write 0600 files")
 		return nil
 	}
-	scopeDir := filepath.Join(*out, scope.User+"-"+scope.Profile)
+	scopeDir := filepath.Join(*out, scope.Profile)
 	if err := os.MkdirAll(scopeDir, 0o700); err != nil {
 		return err
 	}
@@ -234,7 +231,7 @@ func mintNatsCreds(out string, scope natsx.Scope) error {
 			return err
 		}
 	}
-	acc, err := natsauth.GenerateAccount(op, scope.User+"_"+scope.Profile, natsauth.DefaultJSLimits())
+	acc, err := natsauth.GenerateAccount(op, scope.Profile, natsauth.DefaultJSLimits())
 	if err != nil {
 		return err
 	}
@@ -298,7 +295,7 @@ func regenPreload(out string) error {
 // it also mints a fresh operator + system account (initial bootstrap).
 func onboardManifest(scope natsx.Scope, path, operatorSeedB64 string) error {
 	m := map[string]any{
-		"scope": map[string]string{"user": scope.User, "profile": scope.Profile},
+		"scope": map[string]string{"profile": scope.Profile},
 	}
 	var op *natsauth.Operator
 	var err error
@@ -317,7 +314,7 @@ func onboardManifest(scope natsx.Scope, path, operatorSeedB64 string) error {
 		m["operator"] = map[string]string{"seed": string(op.Seed), "jwt": op.JWT, "pub": op.PublicKey}
 		m["system_account"] = map[string]string{"pub": sys.PublicKey, "jwt": sys.JWT}
 	}
-	acc, err := natsauth.GenerateAccount(op, scope.User+"_"+scope.Profile, natsauth.DefaultJSLimits())
+	acc, err := natsauth.GenerateAccount(op, scope.Profile, natsauth.DefaultJSLimits())
 	if err != nil {
 		return err
 	}
@@ -365,10 +362,9 @@ func onboardManifest(scope natsx.Scope, path, operatorSeedB64 string) error {
 
 func cmdRun(args []string) error {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
-	user := fs.String("user", "", "override TALARIA_USER")
 	profile := fs.String("profile", "", "override TALARIA_PROFILE")
 	_ = fs.Parse(args)
-	applyScopeFlags(*user, *profile)
+	applyProfileFlag(*profile)
 
 	cfg, err := natsx.LoadConfig()
 	if err != nil {
@@ -400,7 +396,6 @@ func cmdRun(args []string) error {
 
 func cmdSend(args []string) error {
 	fs := flag.NewFlagSet("send", flag.ExitOnError)
-	user := fs.String("user", "", "override TALARIA_USER")
 	profile := fs.String("profile", "", "override TALARIA_PROFILE")
 	method := fs.String("method", "GET", "HTTP method")
 	url := fs.String("url", "", "target URL (required)")
@@ -416,7 +411,7 @@ func cmdSend(args []string) error {
 	if *url == "" {
 		return fmt.Errorf("--url is required")
 	}
-	applyScopeFlags(*user, *profile)
+	applyProfileFlag(*profile)
 
 	cfg, err := natsx.LoadConfig()
 	if err != nil {
@@ -483,11 +478,8 @@ func cmdSend(args []string) error {
 	return nil
 }
 
-// applyScopeFlags lets --user/--profile override the env before LoadConfig.
-func applyScopeFlags(user, profile string) {
-	if user != "" {
-		_ = os.Setenv("TALARIA_USER", user)
-	}
+// applyProfileFlag lets --profile override the env before LoadConfig.
+func applyProfileFlag(profile string) {
 	if profile != "" {
 		_ = os.Setenv("TALARIA_PROFILE", profile)
 	}

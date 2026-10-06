@@ -62,7 +62,7 @@ type rig struct {
 func newRig(t *testing.T, maxBody int) *rig {
 	t.Helper()
 	url := startServer(t)
-	scope := natsx.Scope{User: "alice", Profile: "work"}
+	scope := natsx.Scope{Profile: "alice"}
 	aID, cID := mustID(t), mustID(t)
 	cfg := natsx.Config{URL: url, Scope: scope, MaxBody: maxBody, RespTTL: time.Hour}
 
@@ -239,7 +239,7 @@ func TestCrossScopeNoDelivery(t *testing.T) {
 	r := newRig(t, 700*1024)                    // scope alice/work
 	defer r.startRunner(t, r.aID.PublicB64())() // runner only for alice/work
 
-	otherScope := natsx.Scope{User: "bob", Profile: "home"}
+	otherScope := natsx.Scope{Profile: "bob"}
 	otherCli := dispatch.New(r.js, r.aID, otherScope, r.cID.PublicB64())
 	j := &job.Job{Method: "GET", URL: ts.URL}
 	if err := otherCli.Publish(context.Background(), j); err != nil {

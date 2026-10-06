@@ -18,11 +18,10 @@ import (
 // Job is a single HTTP request for the runner to execute from C's network.
 type Job struct {
 	ID string `json:"id"`
-	// Scope and sender identity. These are also carried alongside the sealed
-	// payload (subject + NATS header) so the runner can route and pick the
-	// sender's key BEFORE decrypting; inside the sealed envelope they are
-	// authenticated, so a forged header cannot escalate (box.Open would fail).
-	User      string              `json:"user"`
+	// Profile (tenant) and sender identity. The sender is also carried in a NATS
+	// header so the runner can pick the opening key BEFORE decrypting; inside the
+	// sealed envelope these are authenticated, so a forged header cannot escalate
+	// (box.Open would fail).
 	Profile   string              `json:"profile"`
 	Sender    string              `json:"sender"` // base64 public key of the dispatcher
 	Method    string              `json:"method"`

@@ -46,7 +46,6 @@ func (c *Client) Publish(ctx context.Context, j *job.Job) error {
 	if j.CreatedAt.IsZero() {
 		j.CreatedAt = time.Now().UTC()
 	}
-	j.User = c.scope.User
 	j.Profile = c.scope.Profile
 	j.Sender = c.id.PublicB64()
 	if err := j.Validate(); err != nil {
