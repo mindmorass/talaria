@@ -11,6 +11,8 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -71,6 +73,8 @@ usage:
   talaria keygen                        generate one X25519 keypair
   talaria onboard --user U --profile P  mint a scope's dispatcher+runner keys and
                                         config blocks (optionally -out DIR)
+  talaria onboard --user U --profile P --manifest out.json [--operator-seed S]
+                                        mint a tenant as a JSON manifest (for IaC)
   talaria run                           start the runner for a scope (on C)
   talaria send --url URL                dispatch one fetch job for a scope (on A)
   talaria version                       print the version
@@ -106,12 +110,17 @@ func cmdOnboard(args []string) error {
 	profile := fs.String("profile", "", "profile segment of the scope (required)")
 	out := fs.String("out", "", "directory to write env/creds (0600); if empty, print env blocks")
 	mintNats := fs.Bool("mint-nats", false, "also mint NATS operator/account/user JWT creds (requires -out)")
+	manifest := fs.String("manifest", "", "write a machine-readable JSON manifest of this tenant to PATH (0600) and exit")
+	operatorSeed := fs.String("operator-seed", "", "with -manifest: mint under this existing operator seed (adds a tenant); omit to also mint a fresh operator + system account")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	scope := natsx.Scope{User: *user, Profile: *profile}
 	if err := scope.Validate(); err != nil {
 		return err
+	}
+	if *manifest != "" {
+		return onboardManifest(scope, *manifest, *operatorSeed)
 	}
 	disp, err := crypto.GenerateKeypair()
 	if err != nil {
@@ -281,6 +290,77 @@ func regenPreload(out string) error {
 	}
 	b.WriteString("}\n")
 	return os.WriteFile(filepath.Join(out, "preload.conf"), []byte(b.String()), 0o644)
+}
+
+// onboardManifest mints a tenant and writes a JSON manifest with everything the
+// IaC vault needs. With operatorSeedB64 set it mints a NEW account under that
+// existing operator (adding a tenant the live broker already trusts); otherwise
+// it also mints a fresh operator + system account (initial bootstrap).
+func onboardManifest(scope natsx.Scope, path, operatorSeedB64 string) error {
+	m := map[string]any{
+		"scope": map[string]string{"user": scope.User, "profile": scope.Profile},
+	}
+	var op *natsauth.Operator
+	var err error
+	if operatorSeedB64 != "" {
+		if op, err = natsauth.LoadOperator([]byte(operatorSeedB64), "talaria"); err != nil {
+			return fmt.Errorf("load operator: %w", err)
+		}
+	} else {
+		if op, err = natsauth.GenerateOperator("talaria"); err != nil {
+			return err
+		}
+		sys, serr := natsauth.GenerateAccount(op, "SYS", natsauth.JSLimits{})
+		if serr != nil {
+			return serr
+		}
+		m["operator"] = map[string]string{"seed": string(op.Seed), "jwt": op.JWT, "pub": op.PublicKey}
+		m["system_account"] = map[string]string{"pub": sys.PublicKey, "jwt": sys.JWT}
+	}
+	acc, err := natsauth.GenerateAccount(op, scope.User+"_"+scope.Profile, natsauth.DefaultJSLimits())
+	if err != nil {
+		return err
+	}
+	du, err := natsauth.GenerateUser(acc, "dispatcher",
+		[]string{scope.JobsSubject(), "$JS.API.>", "$JS.ACK.>"},
+		[]string{scope.RespWildcard(), "_INBOX.>"})
+	if err != nil {
+		return err
+	}
+	ru, err := natsauth.GenerateUser(acc, "runner",
+		[]string{scope.RespWildcard(), "$JS.API.>", "$JS.ACK.>"},
+		[]string{scope.JobsSubject(), "_INBOX.>"})
+	if err != nil {
+		return err
+	}
+	dkp, err := crypto.GenerateKeypair() // dispatcher NaCl
+	if err != nil {
+		return err
+	}
+	rkp, err := crypto.GenerateKeypair() // runner NaCl
+	if err != nil {
+		return err
+	}
+	m["account"] = map[string]string{"pub": acc.PublicKey, "jwt": acc.JWT}
+	m["runner"] = map[string]string{
+		"self_priv":       rkp.Private,
+		"allowed_senders": dkp.Public,
+		"nats_creds_b64":  base64.StdEncoding.EncodeToString(ru.Creds),
+	}
+	m["dispatcher"] = map[string]string{
+		"self_priv":      dkp.Private,
+		"peer_pub":       rkp.Public,
+		"nats_creds_b64": base64.StdEncoding.EncodeToString(du.Creds),
+	}
+	data, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(path, append(data, '\n'), 0o600); err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "wrote manifest %s (scope %s)\n", path, scope.String())
+	return nil
 }
 
 func cmdRun(args []string) error {
