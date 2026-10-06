@@ -1,0 +1,15 @@
+Talaria
+Copyright 2026 neuralcolony
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product depends on third-party software under permissive licenses. When a
+Talaria binary or container image is redistributed, it embeds compiled forms of:
+
+  - The NATS project (https://github.com/nats-io): nats.go, nats-server,
+    nkeys, jwt, nuid — Apache License 2.0
+  - golang.org/x/crypto, golang.org/x/sys, golang.org/x/time — BSD-3-Clause
+  - github.com/klauspost/compress — BSD-3-Clause / Apache-2.0 / MIT (per subpackage)
+  - github.com/minio/highwayhash, github.com/google/go-tpm — Apache License 2.0
+
+See each project's repository for the full license text and notices.

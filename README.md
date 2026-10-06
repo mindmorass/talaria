@@ -125,3 +125,7 @@ talaria send --profile other --url https://...       # override scope per call
   dropped without decryption; cross-scope traffic is never delivered.
 - `operator.nk` is the root of trust — guard it; `*.creds` and `*.env` contain
   secrets. All are git-ignored.
+
+## License
+
+Apache-2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
