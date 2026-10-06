@@ -1,0 +1,41 @@
+name: release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: version tag to build (e.g. v0.1.0)
+        required: true
+
+permissions:
+  contents: write   # action-gh-release needs this to create the Release
+
+jobs:
+  macos:
+    runs-on: ubuntu-latest   # pure-Go: cross-compiles native darwin binaries, no mac needed
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build macOS binaries
+        env:
+          VERSION: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          mkdir -p dist
+          for arch in arm64 amd64; do
+            CGO_ENABLED=0 GOOS=darwin GOARCH="$arch" \
+              go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
+              -o "dist/talaria-darwin-${arch}" ./cmd/talaria
+          done
+          cd dist && shasum -a 256 talaria-darwin-* > checksums.txt
+          ls -l
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

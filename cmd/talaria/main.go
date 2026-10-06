@@ -28,6 +28,9 @@ import (
 	"github.com/mindmorass/talaria/internal/runner"
 )
 
+// version is stamped at release time via -ldflags "-X main.version=...".
+var version = "dev"
+
 func main() {
 	if len(os.Args) < 2 {
 		usage()
@@ -44,6 +47,9 @@ func main() {
 		err = cmdRun(os.Args[2:])
 	case "send":
 		err = cmdSend(os.Args[2:])
+	case "version", "-v", "--version":
+		fmt.Println(version)
+		return
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -67,6 +73,7 @@ usage:
                                         config blocks (optionally -out DIR)
   talaria run                           start the runner for a scope (on C)
   talaria send --url URL                dispatch one fetch job for a scope (on A)
+  talaria version                       print the version
 
 config via environment (or a .env file in the working dir):
   TALARIA_NATS_URL    wss://... (required)
