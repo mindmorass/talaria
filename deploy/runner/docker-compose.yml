@@ -1,0 +1,25 @@
+# Machine C — the runner (the egress point). Place this machine's runner.env and
+# runner.creds (from `talaria onboard`) next to this file, then: docker compose up -d
+#
+# C has no admin but already has Docker, so the runner runs as a container here.
+services:
+  runner:
+    image: ${TALARIA_IMAGE:-ghcr.io/neuralcolony/talaria:latest}
+    # Or build locally instead of pulling:
+    build:
+      context: ../..
+    command: ["run"]
+    env_file:
+      - ./runner.env
+    environment:
+      # Override the creds path to where it's mounted in the container.
+      - TALARIA_NATS_CREDS=/creds/runner.creds
+      # If this egress is behind Netskope (or any inspecting proxy), point Go at
+      # a CA bundle that includes the inspection CA, mounted below:
+      # - SSL_CERT_FILE=/etc/ssl/talaria/ca-bundle.crt
+    volumes:
+      - ./runner.creds:/creds/runner.creds:ro
+      # Mount the Netskope/inspection CA bundle so inspected TLS validates inside
+      # the container (the host trust store is NOT visible here):
+      # - /etc/ssl/certs/ca-certificates.crt:/etc/ssl/talaria/ca-bundle.crt:ro
+    restart: unless-stopped

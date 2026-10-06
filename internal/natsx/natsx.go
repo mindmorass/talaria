@@ -79,6 +79,12 @@ func (s Scope) RespSubject(id string) string {
 	return "fetch." + s.User + "." + s.Profile + ".responses." + id
 }
 
+// RespWildcard matches all of this scope's response subjects (for subscribe
+// permissions).
+func (s Scope) RespWildcard() string {
+	return "fetch." + s.User + "." + s.Profile + ".responses.>"
+}
+
 // Durable is the per-scope runner consumer name (shared by all runner instances
 // in the scope so they load-balance).
 func (s Scope) Durable() string { return "runners_" + s.User + "_" + s.Profile }

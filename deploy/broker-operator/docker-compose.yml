@@ -1,0 +1,19 @@
+# Machine B — multi-tenant (operator-mode) broker.
+# Generate tenants first:  talaria onboard --mint-nats --out ./tenants --user U --profile P
+# (re-run per tenant; it appends to tenants/preload.conf). Then:  docker compose up -d
+services:
+  nats:
+    image: nats:2.10-alpine
+    command: ["-c", "/etc/nats/nats.conf"]
+    volumes:
+      - ./nats.conf:/etc/nats/nats.conf:ro
+      - ${TALARIA_TENANTS_DIR:-./tenants}:/etc/nats/tenants:ro
+      - talaria-js:/data/jetstream
+    expose:
+      - "8443"
+    # For a reverse proxy on the host, or for local testing:
+    #   ports: ["127.0.0.1:8443:8443"]
+    restart: unless-stopped
+
+volumes:
+  talaria-js:

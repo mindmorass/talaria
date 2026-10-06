@@ -1,0 +1,8 @@
+.git
+/talaria
+/dist
+*.env
+.env
+*.creds
+tenants/
+deploy/*/tenants/

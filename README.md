@@ -1,105 +1,127 @@
 # Talaria
 
-*Talaria — the winged sandals of Hermes.* An **encrypted, asynchronous
-remote-fetch dispatcher**: machine **A** dispatches HTTP fetch jobs, a message
-queue on **B** carries them, and a runner on **C** performs each request from
-inside its network and returns the result. Egress happens on C.
+*Talaria — the winged sandals of Hermes.* An **encrypted, asynchronous,
+multi-tenant remote-fetch dispatcher**: a **dispatcher** (A) sends HTTP fetch
+jobs, a message queue on **B** carries them, and a **runner** (C) performs each
+request from inside its network and returns the result. Egress happens on C.
 
-It is **not** a proxy — there is no tunnel and no end-to-end TLS. C performs the
-request itself and returns the result as a message. The trade buys durability
-(C can be offline), a trivially simple runner, fan-out to many runners, and
-endpoint-side observability.
+It is **not** a proxy — no tunnel, no end-to-end TLS. C performs the request and
+returns the result as a message. The trade buys durability (C can be offline), a
+simple runner, fan-out to many runners, and endpoint-side observability.
 
-## Why this shape
+## Model
 
-C has no OS-level admin and cannot accept inbound connections, so it must dial
-out — which a message queue satisfies (C is just a subscriber). A Tailscale exit
-node would need a kernel TUN device (admin); frp centers on TCP/SOCKS tunneling.
-Neither fits a no-admin, async, HTTP-job model.
-
-## Architecture
-
-```
-  A (dispatcher)            B (NATS JetStream)          C (runner)
-  talaria send  ──publish──▶  stream JOBS      ──pull──▶ open, HTTP fetch (egress),
-   seal to C                  (work queue)               seal, publish
-  talaria ◀──collect by id──  stream RESPONSES ◀────────  response
-```
-
-- **B** is stock `nats-server` (JetStream + WebSocket). Not application code; see
-  `deploy/`.
-- Transport is **wss://** only (TLS), through B's existing reverse proxy.
-- Every job/response envelope is **end-to-end encrypted** with NaCl `box`
-  (X25519). B stores only `{id, nonce, ciphertext}` — it cannot read or forge
-  messages. Only the opaque job id is cleartext (it is the NATS subject).
+- **B** is stock `nats-server` (JetStream + WebSocket). Not application code.
+- Transport is **wss://** only (TLS), through B's reverse proxy.
+- Every job/response is **end-to-end sealed** with NaCl `box` (X25519). B stores
+  only `{id, nonce, ciphertext}`.
+- **Multi-tenant** by **scope = (user, profile)**: subjects are
+  `fetch.<user>.<profile>.jobs` / `.responses.<id>`. A runner serves one scope
+  and authenticates each job's sender against an allowlist; the response is
+  sealed back to that sender.
+- **Auth** is NATS **decentralized JWT** (operator → account → user), one account
+  per tenant for hard isolation + per-account JetStream quotas. Not an external
+  IdP.
 
 ## Build
 
 ```sh
 go build -o talaria ./cmd/talaria
-go test ./...          # unit + in-process JetStream e2e (no external nats-server)
+go test ./...          # unit + in-process JetStream e2e (incl. tenant isolation)
+docker build -t talaria .
 ```
 
-## Setup
+## Provision a tenant
 
-1. **Keys** — on A and on C:
-   ```sh
-   ./talaria keygen
-   ```
-   Keep `TALARIA_SELF_PRIV` on that machine; give the printed public key to the
-   peer as its `TALARIA_PEER_PUB`. (A holds C's public key; C holds A's.)
+```sh
+# Mint a scope's keys, NATS account/user creds, and config blocks:
+talaria onboard --mint-nats --out ./tenants --user alice --profile work
+```
 
-2. **Config** — copy `.env.example` to a local env file on each of A and C and
-   fill in `TALARIA_NATS_URL`, the NATS user/pass for that role, `TALARIA_SELF_PRIV`,
-   and `TALARIA_PEER_PUB`.
+This writes (0600 where secret):
 
-3. **B** — deploy the queue:
-   ```sh
-   cd deploy && TALARIA_DISPATCHER_PASS=... TALARIA_RUNNER_PASS=... docker compose up -d
-   ```
-   Point the reverse proxy's `wss://` route at the container's `8443` WebSocket
-   port. The native 4222 port is never exposed.
+```
+tenants/
+  operator.nk  operator.jwt        # root of trust (keep operator.nk safe)
+  system_account                   # system account pubkey
+  accounts/<pub>.jwt               # one per tenant account (+ system)
+  preload.conf                     # operator + system_account + resolver_preload
+  alice-work/
+    dispatcher.env  dispatcher.creds   # -> machine A
+    runner.env      runner.creds       # -> machine C
+```
+
+Re-run per tenant (it appends to `preload.conf`). For a keys-only onboarding
+(bring your own NATS auth), drop `--mint-nats`.
+
+## Deploy (Docker)
+
+**B — broker** (`deploy/broker-operator/`): put the generated `tenants/` next to
+the compose file, then:
+
+```sh
+cd deploy/broker-operator && docker compose up -d
+```
+
+Point your reverse proxy's `wss://` route at the container's `8443`. The native
+4222 port is never published. (For single-tenant with static passwords instead,
+use `deploy/docker-compose.yml` + `deploy/nats.conf`.)
+
+**C — runner** (`deploy/runner/`): drop that scope's `runner.env` and
+`runner.creds` beside the compose file, set `TALARIA_NATS_URL` in `runner.env` to
+the broker, then:
+
+```sh
+cd deploy/runner && docker compose up -d
+```
+
+If C's egress is behind Netskope (or any inspecting proxy), mount the inspection
+CA into the container and point Go at it — the container has its *own* trust
+store, not the host's. Uncomment the CA volume + `SSL_CERT_FILE` in the runner
+compose.
+
+**A — dispatcher**: a one-shot CLI, from the binary or the image:
+
+```sh
+docker run --rm --env-file dispatcher.env \
+  -e TALARIA_NATS_CREDS=/creds/dispatcher.creds \
+  -v $PWD/dispatcher.creds:/creds/dispatcher.creds:ro \
+  talaria send --url https://api.ipify.org          # prints C's egress IP
+```
+
+Or import `internal/dispatch` directly in your LLM app (same `Publish`/`Collect`
+/`Do`).
 
 ## Use
 
-On C (keep it running — this is the egress point):
 ```sh
-./talaria run
-```
-
-On A:
-```sh
-./talaria send --url https://api.ipify.org          # prints C's egress IP
-./talaria send -i --url https://example.com         # -i includes response headers
-./talaria send --method POST --data '{"x":1}' \
+talaria send --url https://example.com -i           # -i includes response headers
+talaria send --method POST --data '{"x":1}' \
   --header 'Content-Type: application/json' --url https://httpbin.org/post
+talaria send --profile other --url https://...       # override scope per call
 ```
-
-The dispatch library (`internal/dispatch`) exposes the same `Publish` / `Collect`
-/ `Do` for an LLM tool-call on A to use directly.
 
 ## Limits & behavior
 
 - **Response size** is bounded by NATS `max_payload` (default 1 MiB → ~760–780 KB
-  usable body after base64 + seal). Larger responses return an **error**; the
-  documented growth path is NATS Object Store (or Garage/S3) carrying a reference.
-  Raising `max_payload` past ~8 MiB is discouraged.
-- **At-least-once delivery:** a runner crash mid-fetch can redeliver the job, so a
-  request may run twice. Fine for idempotent GETs; a hazard for POST/PUT.
+  usable after base64 + seal). Larger returns an error; growth path is NATS
+  Object Store (or Garage/S3) carrying a reference. Raising past ~8 MiB is
+  discouraged.
+- **At-least-once:** a runner crash mid-fetch can redeliver (fine for GETs; a
+  hazard for POST/PUT).
 - **Always returns:** on error/timeout the runner still publishes an error
   response, so `send` never hangs.
 
 ## Security notes
 
 - **E2E encryption blinds B**, not Netskope. C decrypts and makes the real
-  request in the clear; that egress is exactly what C's Netskope inspects — by
-  design. This tool does **not** evade inspection, and is not meant to.
-- **No cert pinning.** The runner/dispatcher use the system trust store so B's
-  reverse-proxy TLS (and any inline inspection of the C↔B channel) is honored.
-- Traffic from C looks like an automated client (Go `User-Agent`/TLS
-  fingerprint, stateless single requests attributed to C's identity), not a
-  browser. A can set request headers per job; the TLS fingerprint is honest by
-  intent.
-- The NATS auth/TLS deploy config in `deploy/` is validated at **deploy time**
-  (the application tests use an open in-process server). `$JS.API.>` is broad;
-  tightening it is a documented future step.
+  request in the clear; that egress is what C's Netskope inspects — by design.
+  This tool does **not** evade inspection and isn't meant to.
+- **No cert pinning.** Runner/dispatcher use the system trust store so B's
+  reverse-proxy TLS (and inspection of the C↔B channel) is honored.
+- **Tenant isolation** is enforced on three layers: NATS account per tenant
+  (routing + quotas), scoped subjects, and per-scope NaCl keys + a runner sender
+  allowlist (confidentiality + authenticity). An unauthorized sender's job is
+  dropped without decryption; cross-scope traffic is never delivered.
+- `operator.nk` is the root of trust — guard it; `*.creds` and `*.env` contain
+  secrets. All are git-ignored.

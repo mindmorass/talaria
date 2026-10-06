@@ -23,6 +23,7 @@ import (
 	"github.com/neuralcolony/talaria/internal/crypto"
 	"github.com/neuralcolony/talaria/internal/dispatch"
 	"github.com/neuralcolony/talaria/internal/job"
+	"github.com/neuralcolony/talaria/internal/natsauth"
 	"github.com/neuralcolony/talaria/internal/natsx"
 	"github.com/neuralcolony/talaria/internal/runner"
 )
@@ -96,7 +97,8 @@ func cmdOnboard(args []string) error {
 	fs := flag.NewFlagSet("onboard", flag.ExitOnError)
 	user := fs.String("user", "", "user segment of the scope (required)")
 	profile := fs.String("profile", "", "profile segment of the scope (required)")
-	out := fs.String("out", "", "directory to write dispatcher.env and runner.env (0600); if empty, print")
+	out := fs.String("out", "", "directory to write env/creds (0600); if empty, print env blocks")
+	mintNats := fs.Bool("mint-nats", false, "also mint NATS operator/account/user JWT creds (requires -out)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -113,27 +115,37 @@ func cmdOnboard(args []string) error {
 		return err
 	}
 
+	// NATS auth lines differ depending on whether we mint creds.
+	dispAuth := "TALARIA_NATS_USER=\nTALARIA_NATS_PASS="
+	runAuth := "TALARIA_NATS_USER=\nTALARIA_NATS_PASS="
+	if *mintNats {
+		if *out == "" {
+			return fmt.Errorf("-mint-nats requires -out DIR (to persist the operator seed)")
+		}
+		if err := mintNatsCreds(*out, scope); err != nil {
+			return err
+		}
+		dispAuth = "TALARIA_NATS_CREDS=dispatcher.creds"
+		runAuth = "TALARIA_NATS_CREDS=runner.creds"
+	}
+
 	dispEnv := fmt.Sprintf(`# talaria DISPATCHER (machine A) — scope %s
 TALARIA_USER=%s
 TALARIA_PROFILE=%s
 TALARIA_SELF_PRIV=%s
 TALARIA_PEER_PUB=%s
-# fill in transport + NATS auth for this scope:
 TALARIA_NATS_URL=wss://b.example.com/talaria
-TALARIA_NATS_USER=
-TALARIA_NATS_PASS=
-`, scope.String(), scope.User, scope.Profile, disp.Private, run.Public)
+%s
+`, scope.String(), scope.User, scope.Profile, disp.Private, run.Public, dispAuth)
 
 	runEnv := fmt.Sprintf(`# talaria RUNNER (machine C) — scope %s
 TALARIA_USER=%s
 TALARIA_PROFILE=%s
 TALARIA_SELF_PRIV=%s
 TALARIA_ALLOWED_SENDERS=%s
-# fill in transport + NATS auth for this scope:
 TALARIA_NATS_URL=wss://b.example.com/talaria
-TALARIA_NATS_USER=
-TALARIA_NATS_PASS=
-`, scope.String(), scope.User, scope.Profile, run.Private, disp.Public)
+%s
+`, scope.String(), scope.User, scope.Profile, run.Private, disp.Public, runAuth)
 
 	if *out == "" {
 		fmt.Printf("# ===== dispatcher.env (machine A) =====\n%s\n", dispEnv)
@@ -141,20 +153,127 @@ TALARIA_NATS_PASS=
 		fmt.Fprintln(os.Stderr, "note: these contain PRIVATE keys; prefer -out DIR to write 0600 files")
 		return nil
 	}
-	if err := os.MkdirAll(*out, 0o700); err != nil {
+	scopeDir := filepath.Join(*out, scope.User+"-"+scope.Profile)
+	if err := os.MkdirAll(scopeDir, 0o700); err != nil {
 		return err
 	}
-	dp := filepath.Join(*out, "dispatcher.env")
-	rp := filepath.Join(*out, "runner.env")
-	if err := os.WriteFile(dp, []byte(dispEnv), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(scopeDir, "dispatcher.env"), []byte(dispEnv), 0o600); err != nil {
 		return err
 	}
-	if err := os.WriteFile(rp, []byte(runEnv), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(scopeDir, "runner.env"), []byte(runEnv), 0o600); err != nil {
 		return err
 	}
-	fmt.Printf("wrote %s and %s (0600)\n", dp, rp)
-	fmt.Println("deliver dispatcher.env to A and runner.env to C; set NATS auth in each.")
+	if *mintNats {
+		// move the role creds (written to *out by mintNatsCreds) next to their env
+		for _, f := range []string{"dispatcher.creds", "runner.creds"} {
+			_ = os.Rename(filepath.Join(*out, f), filepath.Join(scopeDir, f))
+		}
+	}
+	fmt.Printf("wrote %s/{dispatcher.env,runner.env%s}\n", scopeDir, map[bool]string{true: ",dispatcher.creds,runner.creds"}[*mintNats])
+	if *mintNats {
+		fmt.Printf("operator + account JWTs in %s (operator.jwt, accounts/, preload.conf) — wire into deploy/nats-operator.conf\n", *out)
+	}
 	return nil
+}
+
+// mintNatsCreds creates (or reuses) the operator in out/, mints a fresh account
+// for the scope with JetStream enabled, and writes dispatcher.creds + runner.creds
+// (to out/, moved into the scope dir by the caller). It regenerates preload.conf.
+func mintNatsCreds(out string, scope natsx.Scope) error {
+	if err := os.MkdirAll(filepath.Join(out, "accounts"), 0o700); err != nil {
+		return err
+	}
+	opSeedPath := filepath.Join(out, "operator.nk")
+	var op *natsauth.Operator
+	if seed, rerr := os.ReadFile(opSeedPath); rerr == nil {
+		var err error
+		op, err = natsauth.LoadOperator([]byte(strings.TrimSpace(string(seed))), "talaria")
+		if err != nil {
+			return fmt.Errorf("load operator: %w", err)
+		}
+	} else {
+		var err error
+		op, err = natsauth.GenerateOperator("talaria")
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(opSeedPath, op.Seed, 0o600); err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(out, "operator.jwt"), []byte(op.JWT), 0o644); err != nil {
+			return err
+		}
+	}
+	// Ensure a system account exists (needed by JetStream in operator mode).
+	sysPath := filepath.Join(out, "system_account")
+	if _, serr := os.Stat(sysPath); serr != nil {
+		sys, err := natsauth.GenerateAccount(op, "SYS", natsauth.JSLimits{})
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(out, "accounts", sys.PublicKey+".jwt"), []byte(sys.JWT), 0o644); err != nil {
+			return err
+		}
+		if err := os.WriteFile(sysPath, []byte(sys.PublicKey), 0o644); err != nil {
+			return err
+		}
+	}
+	acc, err := natsauth.GenerateAccount(op, scope.User+"_"+scope.Profile, natsauth.DefaultJSLimits())
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(out, "accounts", acc.PublicKey+".jwt"), []byte(acc.JWT), 0o644); err != nil {
+		return err
+	}
+	// JetStream needs pub to $JS.API.> (control) AND $JS.ACK.> (message acks).
+	dispPub := []string{scope.JobsSubject(), "$JS.API.>", "$JS.ACK.>"}
+	dispSub := []string{scope.RespWildcard(), "_INBOX.>"}
+	runPub := []string{scope.RespWildcard(), "$JS.API.>", "$JS.ACK.>"}
+	runSub := []string{scope.JobsSubject(), "_INBOX.>"}
+	du, err := natsauth.GenerateUser(acc, "dispatcher", dispPub, dispSub)
+	if err != nil {
+		return err
+	}
+	ru, err := natsauth.GenerateUser(acc, "runner", runPub, runSub)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(out, "dispatcher.creds"), du.Creds, 0o600); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(out, "runner.creds"), ru.Creds, 0o600); err != nil {
+		return err
+	}
+	return regenPreload(out)
+}
+
+// regenPreload rebuilds preload.conf from operator.jwt + accounts/*.jwt so the
+// server can be started with all known tenant accounts.
+func regenPreload(out string) error {
+	opJWT, err := os.ReadFile(filepath.Join(out, "operator.jwt"))
+	if err != nil {
+		return err
+	}
+	entries, err := filepath.Glob(filepath.Join(out, "accounts", "*.jwt"))
+	if err != nil {
+		return err
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "operator: %s\n\n", strings.TrimSpace(string(opJWT)))
+	if sysPub, err := os.ReadFile(filepath.Join(out, "system_account")); err == nil {
+		fmt.Fprintf(&b, "system_account: %s\n\n", strings.TrimSpace(string(sysPub)))
+	}
+	b.WriteString("resolver: MEMORY\n\nresolver_preload: {\n")
+	for _, e := range entries {
+		pub := strings.TrimSuffix(filepath.Base(e), ".jwt")
+		jwtBytes, err := os.ReadFile(e)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(&b, "  %s: %s\n", pub, strings.TrimSpace(string(jwtBytes)))
+	}
+	b.WriteString("}\n")
+	return os.WriteFile(filepath.Join(out, "preload.conf"), []byte(b.String()), 0o644)
 }
 
 func cmdRun(args []string) error {

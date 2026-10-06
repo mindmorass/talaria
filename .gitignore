@@ -2,4 +2,7 @@
 *.exe
 .env
 *.creds
+*.nk
+tenants/
+deploy/**/tenants/
 /dist/
