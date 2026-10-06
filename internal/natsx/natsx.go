@@ -2,11 +2,9 @@
 // connecting (TLS/wss only in production), declaring the JOBS and RESPONSES
 // streams, scoped subject construction, and configuration from the environment.
 //
-// Multi-tenant: traffic is namespaced by scope = (user, profile). Subjects are
-// fetch.<user>.<profile>.jobs and fetch.<user>.<profile>.responses.<id>. A
-// shared set of streams captures all scopes via wildcards; each runner binds a
-// per-scope consumer. (A full per-account deployment uses the same subject
-// shape inside each account — see the plan's multi-tenancy section.)
+// Multi-tenant: traffic is namespaced by profile (one NATS account per profile).
+// Subjects are fetch.<profile>.jobs and fetch.<profile>.responses.<id>. Each
+// runner binds a per-profile consumer.
 package natsx
 
 import (
@@ -26,8 +24,8 @@ const (
 	StreamResponses = "TALARIA_RESP"
 
 	// Wildcard subjects the shared streams capture.
-	SubjectJobsWildcard = "fetch.*.*.jobs"
-	SubjectRespWildcard = "fetch.*.*.responses.>"
+	SubjectJobsWildcard = "fetch.*.jobs"
+	SubjectRespWildcard = "fetch.*.responses.>"
 
 	// HeaderSender carries the dispatcher's base64 public key in cleartext so the
 	// runner can select the opening key before decrypting. It is authenticated
@@ -35,9 +33,9 @@ const (
 	HeaderSender = "Talaria-Sender"
 )
 
-// Scope namespaces all traffic for one (user, profile) tenant.
+// Scope namespaces all traffic for one tenant, identified by its profile name
+// (which is also the NATS account name).
 type Scope struct {
-	User    string
 	Profile string
 }
 
@@ -58,36 +56,33 @@ func validToken(s string) bool {
 	return true
 }
 
-// Validate ensures the scope segments are safe to embed in subjects/durables.
+// Validate ensures the profile is safe to embed in subjects/durables.
 func (s Scope) Validate() error {
-	if !validToken(s.User) {
-		return fmt.Errorf("scope: invalid user %q (use [A-Za-z0-9_-])", s.User)
-	}
 	if !validToken(s.Profile) {
 		return fmt.Errorf("scope: invalid profile %q (use [A-Za-z0-9_-])", s.Profile)
 	}
 	return nil
 }
 
-func (s Scope) String() string { return s.User + "/" + s.Profile }
+func (s Scope) String() string { return s.Profile }
 
-// JobsSubject is where this scope's jobs are published/consumed.
-func (s Scope) JobsSubject() string { return "fetch." + s.User + "." + s.Profile + ".jobs" }
+// JobsSubject is where this profile's jobs are published/consumed.
+func (s Scope) JobsSubject() string { return "fetch." + s.Profile + ".jobs" }
 
 // RespSubject is where a single job's response is published/collected.
 func (s Scope) RespSubject(id string) string {
-	return "fetch." + s.User + "." + s.Profile + ".responses." + id
+	return "fetch." + s.Profile + ".responses." + id
 }
 
-// RespWildcard matches all of this scope's response subjects (for subscribe
+// RespWildcard matches all of this profile's response subjects (for subscribe
 // permissions).
 func (s Scope) RespWildcard() string {
-	return "fetch." + s.User + "." + s.Profile + ".responses.>"
+	return "fetch." + s.Profile + ".responses.>"
 }
 
-// Durable is the per-scope runner consumer name (shared by all runner instances
-// in the scope so they load-balance).
-func (s Scope) Durable() string { return "runners_" + s.User + "_" + s.Profile }
+// Durable is the per-profile runner consumer name (shared by all runner
+// instances in the profile so they load-balance).
+func (s Scope) Durable() string { return "runners_" + s.Profile }
 
 // Config is resolved from the environment. Secrets never get logged.
 type Config struct {
@@ -97,7 +92,7 @@ type Config struct {
 	NatsPass string // TALARIA_NATS_PASS
 	Creds    string // TALARIA_NATS_CREDS (path to a .creds file)
 
-	Scope Scope // TALARIA_USER / TALARIA_PROFILE
+	Scope Scope // TALARIA_PROFILE (the tenant / account name)
 
 	SelfPriv       string   // TALARIA_SELF_PRIV (base64 X25519 private key)
 	PeerPub        string   // TALARIA_PEER_PUB  (dispatcher: the runner's public key)
@@ -117,7 +112,7 @@ func LoadConfig() (Config, error) {
 		NatsUser: os.Getenv("TALARIA_NATS_USER"),
 		NatsPass: os.Getenv("TALARIA_NATS_PASS"),
 		Creds:    os.Getenv("TALARIA_NATS_CREDS"),
-		Scope:    Scope{User: os.Getenv("TALARIA_USER"), Profile: os.Getenv("TALARIA_PROFILE")},
+		Scope:    Scope{Profile: os.Getenv("TALARIA_PROFILE")},
 		SelfPriv: os.Getenv("TALARIA_SELF_PRIV"),
 		PeerPub:  os.Getenv("TALARIA_PEER_PUB"),
 		MaxBody:  700 * 1024,
@@ -151,7 +146,7 @@ func LoadConfig() (Config, error) {
 		return c, fmt.Errorf("TALARIA_NATS_URL is required")
 	}
 	if err := c.Scope.Validate(); err != nil {
-		return c, fmt.Errorf("%w (set TALARIA_USER and TALARIA_PROFILE)", err)
+		return c, fmt.Errorf("%w (set TALARIA_PROFILE)", err)
 	}
 	return c, nil
 }

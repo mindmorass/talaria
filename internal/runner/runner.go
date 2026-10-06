@@ -101,8 +101,8 @@ func (r *Runner) handle(ctx context.Context, msg jetstream.Msg) {
 		return
 	}
 	// Defense in depth: the authenticated envelope must agree with the routing.
-	if j.Sender != sender || j.User != r.scope.User || j.Profile != r.scope.Profile {
-		r.log.Error("drop job: scope/sender mismatch", "job_scope", j.User+"/"+j.Profile, "runner_scope", r.scope.String())
+	if j.Sender != sender || j.Profile != r.scope.Profile {
+		r.log.Error("drop job: profile/sender mismatch", "job_profile", j.Profile, "runner_profile", r.scope.String())
 		_ = msg.Term()
 		return
 	}
