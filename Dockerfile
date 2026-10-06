@@ -1,10 +1,17 @@
 # Single image for all talaria roles (run / send / onboard / keygen).
-FROM golang:1.26-alpine AS build
+# Cross-compiled: the Go build runs on the BUILD platform and targets TARGETARCH,
+# so multi-arch (linux/amd64 + linux/arm64) builds without QEMU-emulating the
+# compiler — only the tiny final stage is per-arch.
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS build
+ARG TARGETOS
+ARG TARGETARCH
+ARG VERSION=dev
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -ldflags "-s -w" -o /talaria ./cmd/talaria
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o /talaria ./cmd/talaria
 
 FROM alpine:3.20
 # ca-certificates so the runner can validate TLS to origins. On C, also mount
